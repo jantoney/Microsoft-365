@@ -1,0 +1,531 @@
+<#
+#
+# This script is designed to import a CSV file and
+#  - Add the required Phone System License to the user
+#  - Enterprise Voice Enable users
+#  - Assign a calling policy to users
+#  - Assign a DID phone number to uses (based on the CSV script)
+#
+# CSV FILE
+# Requires a file with headders
+# - UserPrincipalName
+# - DID
+#
+# REQUIREMENTS
+# The following powershell modules are required and will be checked and installed on script run
+# - Skype for Business Online
+# - Azure AD
+# - Voice callign policy named 'Australia'.
+#
+# File released under GPL v3.0. Please leave this comment in-tack when re-distributing
+# Written by Jay Antoney
+#
+# Further Notes
+# There is a lot wrong with this script because it was written quickly, but it works.
+# I'll update and change it over time, please feel free to make comments or do a pull request as required.
+# Instead of copying this and redistributing, let's keep the script here, update it and link back to it. Single source of truth :)
+# ** The script has been written for AUSTRALIAN users only, I'll update the script at some point - or you can help ;) **
+#
+# TO-DO
+# - Check if the first CHAR is a + symbol in the CSV file and remove it
+# - Check the 2nd & 3rd CHAR are 61
+# - Check the 4th is a valid area code number (2, 3, 8 & 7)
+# - Change the script to allow any County and Calling Policy Name
+# 
+#>
+
+$DebugPreference = "Continue"
+#$DebugPreference = "SilentlyContinue"
+
+:fullScript
+
+Function Get-UserCreds()
+{
+    Write-Debug "Enter Get-UserCreds"
+    
+    if($global:userCreds -ne $null)
+    {
+        $tempUsername = $global:userCreds.UserName
+        Write-Debug "Credentials already set. Username = $tempUsername"
+        Write-Debug "Exit Get-UserCreds"
+        return $true
+    }
+
+    [int]$counter = 1;
+    do 
+    {
+        if($counter -le 3)
+        {
+            Write-Debug "Get-UserCreds `$counter is less than 3 (value = $counter)"
+            $userCreds = $null
+            Try
+            {
+               $global:userCreds = Get-Credential -Message "Please enter the customers Azure Global Admin Credentials - Attempt $counter/3" -ErrorAction Stop
+            }
+            Catch
+            {
+               $ErrorMsg = $_.Exception.Message
+               Write-Warning "Failed to validate credentials. Please close and try again...: $ErrorMsg "
+               Pause
+               break fullScript
+            }
+            Write-Debug "`$userCreds = $userCreds"
+            Write-Debug "Get-UserCreds `$counter = $counter"
+            $counter++
+        } else {
+            Write-Debug "Get-UserCreds `$counter is over 3 (Value = $counter)"
+            Disconnect-AllSessions
+            #Exit
+            Write-Host "We've tried a few times to get your credentials, but it didn't seem to work. Please close and try again..." -ForegroundColor Yellow -BackgroundColor Red
+            Pause
+            break fullScript
+        }
+     }
+     Until($global:userCreds -ne $null);
+     
+     if (-not $global:userCreds.UserName.Contains("@") -and -not $global:userCreds.UserName.Contains("."))
+     {
+        Write-Debug "Get-UserCreds username doesn't contain the two symbols @ and ."
+        Disconnect-AllSessions
+        #Exit
+        Write-Host "Seems the username you used isn't formatted correctly. It should be in the format of an email address. Let's try again..." -ForegroundColor Yellow -BackgroundColor Red
+        Pause
+        return(Get-UserCreds)
+     }
+
+     
+     Write-Debug "Exit Get-UserCreds"
+     return $true
+}
+
+Function Check-AzureADLogin()
+{
+    Write-Debug "Enter Check-AzureAD"
+    #Connect to AzureAD
+    Write-Host "We're checking if you're already connected to Azure AD..." -ForegroundColor Black -BackgroundColor Cyan
+
+    try {Get-AzureADTenantDetail -ErrorAction Stop} 
+    catch
+    {
+        Write-Host "OK, you're not logged into Azure AD - Let's try get you connected!"
+        Get-UserCreds
+        
+        try {$azureConnection = Connect-AzureAD -Credential $global:userCreds -ErrorAction Stop}
+        catch 
+        {
+            #Check we're working on the correct AzureAD Tennant
+            $Title3 = "Whats Wrong?"
+            $Info3 = "Something went wrong during login. Did you want to try again?"
+            $options3 = [System.Management.Automation.Host.ChoiceDescription[]] @("&Yes", "&Quit")
+            [int]$defaultchoice3 = 1
+            $opt3 = $host.UI.PromptForChoice($Title3 , $Info3 , $Options3,$defaultchoice3)
+
+            #If no, then logout and re-prompt
+            if($opt3 -eq 1)
+            {
+                Disconnect-AllSessions
+                #Exit
+                Break fullScript
+            } Else {
+                Write-Host "As you wish, trying to login again..."
+                Disconnect-AllSessions
+                Write-Debug "Entering nested Check-AzureADLogin"                
+                return(Check-AzureADLogin)
+            }
+        }
+    }
+
+    #Logged IN
+    #Check we're working on the correct AzureAD Tennant
+    $global:tenantName = $null
+    Try {Get-AzureADTenantDetail -ErrorAction Stop}
+    Catch {Write-Host "It seems we're somehow still not logged in. Please close the script and re-open to try it again" -ForegroundColor Yellow -BackgroundColor Red; Disconnect-AllSessions; Pause; break} #We're not logged in... WHAT!
+    $global:tenantName = (Get-AzureADTenantDetail).DisplayName
+    $Title2 = "Is this correct?"
+    $Info2 = "Is this the correct Azure AD Tenant? " + $global:tenantName
+    $options2 = [System.Management.Automation.Host.ChoiceDescription[]] @("&Yes", "&No")
+    [int]$defaultchoice2 = 0
+    $opt2 = $host.UI.PromptForChoice($Title2 , $Info2 , $Options2,$defaultchoice2)
+
+    #If no, then logout and re-prompt
+    if($opt2 -eq 1)
+    {
+        Write-Host "Wrong tenant it seems..."
+        Disconnect-AllSessions
+        Check-AzureADLogin
+    }
+    
+    Write-Debug "Exit Check-AzureAD"
+}
+
+Function Check-SkypeLogin()
+{
+    Write-Debug "Enter Check-SkypeLogin"
+    #Connect to Skype for Business Online
+    Write-Host "We're checking if you're already connected to Skype Online..." -ForegroundColor Black -BackgroundColor Cyan
+    
+    try {Get-CsTenant -ErrorAction Stop} 
+    catch
+    {
+        Write-Host "OK, you're not logged into Skype Online - Let's try get you connected!"
+        Get-UserCreds
+        
+        try {$global:skypeConnection = New-CsOnlineSession -Credential $global:userCreds -ErrorAction Stop}
+        catch 
+        {
+            Write-Debug "Skype Login Failed. Username was"
+            Write-Debug $global:userCreds.UserName
+            #Check we're working on the correct AzureAD Tennant
+            $Title3 = "Whats Wrong?"
+            $Info3 = "Something went wrong during login. Did you want to try again?"
+            $options3 = [System.Management.Automation.Host.ChoiceDescription[]] @("&Yes", "&No")
+            [int]$defaultchoice3 = 0
+            $opt3 = $host.UI.PromptForChoice($Title3 , $Info3 , $Options3,$defaultchoice3)
+
+            #If no, then logout and re-prompt
+            if($opt3 -eq 1)
+            {
+                Disconnect-AllSessions
+                #Exit
+                Break fullScript
+            } Else {
+                Write-Host "As you wish, trying to login again..."
+                Disconnect-AllSessions
+                Write-Debug "Entering nested Check-SkypeLogin"                
+                return(Check-SkypeLogin)
+            }
+        }
+
+        Import-PSSession $global:skypeConnection -AllowClobber | out-null
+    }
+
+    #logged in
+    #Check this is the same tenant as AzureAD
+    $skypeTenantName = Get-CsTenant | Select DisplayName
+    
+    if($global:tenantName -ne $skypeTenantName.DisplayName)
+    {
+        Write-Host "The Skype for Business Online tenant we connected to isn't the same as the Azure AD tenant... Whoops! - Let's try that again" -ForegroundColor Yellow -BackgroundColor Red
+        Write-Debug "Tenant name mismatch. Logging out and entering nested Check-AzureADLogin to re-login in full" 
+        Disconnect-AllSessions
+        pause              
+        return(Check-AzureADLogin)
+    }
+    Write-Debug "Exit Check-SkypeLogin"
+}
+
+Function Get-UsersFromCsv()
+{
+    [System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null
+    
+    $OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+    $OpenFileDialog.initialDirectory = "$env:userprofile\Downloads"
+    $OpenFileDialog.filter = "CSV (*.csv)| *.csv"
+    $OpenFileDialog.ShowDialog() | Out-Null
+    $inputfile = $OpenFileDialog.filename
+    [int]$inputfileLen = $inputfile.Length
+    $global:inputdata = $null
+    Write-Debug "`$inputfile length is: $inputfileLen"
+    if ($inputfileLen -le 1)
+    {
+        Write-Debug "`$inputfile length is less than 1 - return False"
+        return $false
+    } else {
+        $global:inputdata = import-csv $inputfile -ErrorAction SilentlyContinue
+        Write-Debug "CSV Imported"
+
+        if($global:inputdata -ne $null)
+        {
+            Write-Debug "Start Validate-CSVData"
+            return(Validate-CSVData)
+        } else {
+            Write-Debug "No data imported - return False"
+            return($false)
+        }
+    }
+}
+
+Function Check-InstalledModules()
+{
+    if(Get-Module SkypeOnlineConnector -ListAvailable)
+    {
+        Import-Module SkypeOnlineConnector
+    } else {
+        Write-host "The Skype for Business Online Powershell Module isn't installed!" -ForegroundColor Yellow -BackgroundColor Red
+        Write-Host "We're opening the download page now for you!" -ForegroundColor Yellow -BackgroundColor Red
+        write-host "URL: https://www.microsoft.com/en-us/download/details.aspx?id=39366" -ForegroundColor Yellow -BackgroundColor Red
+        write-host "After installing, you'll need to re-run the PowerShell script after first closing the PowerShell Window" -ForegroundColor Yellow -BackgroundColor Red
+        Pause
+        Start-Process "https://www.microsoft.com/en-us/download/details.aspx?id=39366"
+        Break
+    }
+
+    if(-Not (Get-Module AzureAD -ListAvailable))
+    {
+        Write-host "The AzureAD Powershell Module isn't installed!" -ForegroundColor Yellow -BackgroundColor Red
+        Write-Host "We're going to try install it for you!" -ForegroundColor Yellow -BackgroundColor Red
+        write-host "Please EXIT the script now if you don't want to install it" -ForegroundColor Yellow -BackgroundColor Red
+        Pause
+        Try{Install-Module AzureAD -AllowClobber -ErrorAction Stop}
+        Catch{Write-Host "Unable to install the AzureAD PowerShell Module!"; Write-Host "Please try run 'Install-Module AzureAD -AllowClobber' from an elevated PowerShell window..." -ForegroundColor Yellow -BackgroundColor Red}
+        write-host "After installing, you'll need to re-run the PowerShell script after first closing the PowerShell Window" -ForegroundColor Yellow -BackgroundColor Red
+        Pause
+        break
+    }
+
+}
+
+Function Disconnect-AllSessions()
+{
+    Write-Debug "Enter Disconnect-AllSessions"
+    Get-PSSession | Remove-PSSession | out-null
+    $global:skypeConnection = $null
+    $loginerror = $null
+    $global:userCreds = $null
+    if(($global:tenantName).length -gt 1) {write-host "We've logged you out of: "$global:tenantName}
+    $global:tenantName = $null
+    $global:inputdata = $null
+    $global:csvimportCheck = $false
+    $global:userCredsCheck = $False
+    $ErrorMsg = $null
+    try{Disconnect-AzureAD -ErrorAction SilentlyContinue}
+    Catch{Write-Debug "Disconnect-AzureAD Failed. $ErrorMsg"}
+    Write-Debug "Exit Disconnect-AllSessions"
+
+}
+
+Function Validate-CSVData()
+{
+    Write-Debug "Enter Validate-CSVData"
+    Write-Host "Validating the data in the CSV file" -ForegroundColor Black -BackgroundColor Cyan
+    foreach($csvUser in $global:inputdata)
+    {
+        #Check there is an @ symbol in the UPN. If not then exit
+        if(-not ($csvUser.UserPrincipalName).contains("@"))
+        {
+            Write-Host "The UPN for "$csvUser.UserPrincipalName" is not formatted correctly" -ForegroundColor Yellow -BackgroundColor Red
+            Disconnect-AllSessions
+            return $false
+        }
+        
+        $tempDID = $csvUser.DID
+        Switch($tempDID.length)
+        {
+            8 #User number is too short and we don't know the Area Code. Exit
+                {
+                    Write-Host "The numbers entered in the CSV file aren't in the correct format 61xxxxxxxxx.  Please correct and let's try again" -ForegroundColor Yellow -BackgroundColor Red
+                    Write-Host $csvUser.UserPrincipalName" - Number Entered: "$csvUser.DID -ForegroundColor Yellow -BackgroundColor Red
+                    Disconnect-AllSessions
+                    return $false
+                }
+            9 #User number doesn't have the Country Code - Add it
+                {
+                    $newNum = "61" + $csvUser.DID
+                    Write-Host "Modify - DID number re-written for "$csvUser.UserPrincipalName" - from "$csvUser.DID" to "$newNum
+                    $csvUser.DID = $newNum
+                }
+            10 #User number includes the area code with leading 0, drop it and add the country code
+                {
+                    if($csvUser.DID.Substring(0,1) -eq 0) #If there is a leading 0 then drop and add country code
+                    {
+                        $newNum = "61" + $csvUser.DID.Substring(1,9)
+                        Write-Host "Modify - DID number re-written for "$csvUser.UserPrincipalName" - from "$csvUser.DID" to "$newNum
+                        $csvUser.DID = $newNum
+                    } else { #Not too sure what's wrong - just exit
+                        Write-Host "The numbers entered in the CSV file aren't in the correct format 61xxxxxxxxx.  Please correct and let's try again" -ForegroundColor Yellow -BackgroundColor Red
+                        Write-Host $csvUser.UserPrincipalName" - Number Entered: "$csvUser.DID -ForegroundColor Yellow -BackgroundColor Red
+                        Disconnect-AllSessions
+                        return $false
+                    }
+                    
+                }
+            11 #Number is the correct length. Just check the start is a country code first
+                {
+                    if(-not $csvUser.DID.Substring(0,2) -eq 61) #If not a country code then exit
+                    {
+                        Write-Host "The numbers entered in the CSV file aren't in the correct format 61xxxxxxxxx.  Please correct and let's try again" -ForegroundColor Yellow -BackgroundColor Red
+                        Write-Host $csvUser.UserPrincipalName" - Number Entered: "$csvUser.DID -ForegroundColor Yellow -BackgroundColor Red
+                        Disconnect-AllSessions
+                        return $false
+                    }
+                    #ELSE - User number is OK. Do nothing
+                }
+            12 #Maybe the area code has a 0, if so drop it
+                {
+                    if($csvUser.DID.Substring(2,1) -eq 0) #If there is a 0 in the Area Code, drop it
+                    {
+                        $newNum = "61" + $csvUser.DID.Substring(3,9)
+                        Write-Host "Modify - DID number re-written for "$csvUser.UserPrincipalName" - from "$csvUser.DID" to "$newNum
+                        $csvUser.DID = $newNum
+                    } else { #Not too sure what's wrong - just exit
+                        Write-Host "The numbers entered in the CSV file aren't in the correct format 61xxxxxxxxx.  Please correct and let's try again" -ForegroundColor Yellow -BackgroundColor Red
+                        Write-Host $csvUser.UserPrincipalName" - Number Entered: "$csvUser.DID -ForegroundColor Yellow -BackgroundColor Red
+                        Disconnect-AllSessions
+                        return $false
+                    }
+                }
+            default #No idea what is wrong, just exit
+                {
+                    Write-Host "The numbers entered in the CSV file aren't in the correct format 61xxxxxxxxx.  Please correct and let's try again" -ForegroundColor Yellow -BackgroundColor Red
+                    Write-Host $csvUser.UserPrincipalName" - Number Entered: "$csvUser.DID -ForegroundColor Yellow -BackgroundColor Red
+                    Disconnect-AllSessions
+                    return $false
+                }
+        }
+
+    }
+
+    #if we got this far, then everything seems OK! - noting any changes required in the TO-DO list earlier
+    Write-Host "Data in the CSV looks all good"
+    Write-Debug "Exit Validate-CSVData"
+    return $true
+}
+
+Check-InstalledModules
+Disconnect-AllSessions
+#Clear
+
+#Initial Warning Message
+$Title1 = "User Location Warning"
+$Info1 = "This script is for users located in AUSTRALIA only and will set all users usage locations to AUSTRALIA. Are you sure you want to continue?"
+$options1 = [System.Management.Automation.Host.ChoiceDescription[]] @("&Yes", "&Quit")
+[int]$defaultchoice1 = 1
+$opt1 = $host.UI.PromptForChoice($Title1 , $Info1 , $Options1,$defaultchoice1)
+
+#If the user selected to quit
+if($opt1 -eq 1) {
+    #Exit
+    Write-Host "To confirm, you've selected that your users are NOT in AUSTRALIA." -ForegroundColor Yellow -BackgroundColor Red
+    Write-Host "Sorry, but this script is only for AUSTRALIAN users so far" -ForegroundColor Yellow -BackgroundColor Red
+    Pause
+    Break fullScript
+}
+
+#get the CSV list of users & validate the data
+while($global:csvimportCheck -ne $true){$global:csvimportCheck = Get-UsersFromCsv; Write-Debug "ImportCheck = $csvimportcheck"; if($global:csvimportCheck -ne $true){Pause}}
+#do {$global:csvimportCheck = Get-UsersFromCsv} until($global:csvimportCheck = $true) #### This line never worked
+Write-host "We've got the users and all looks OK"
+$numUsers = ($global:inputdata | Measure-Object).Count
+Write-Host $numUsers" users were imported from the CSV"
+
+
+#Check the Azure Login and that it's the correct tenant
+Check-AzureADLogin
+Check-SkypeLogin
+Write-Host "Cool! We're all logged in"
+
+#Ask if E3 or E5 licenses
+#if E3 we need to assign a phone System license
+$Title = "What licenses?"
+$Info = "Next up we need to know if we need to assign Phone System licenses. Do these users have Office or Microsoft E5 licenses?"
+$options = [System.Management.Automation.Host.ChoiceDescription[]] @("&Yes", "&No")
+[int]$defaultchoice = 1
+$needLicenses = $host.UI.PromptForChoice($Title , $Info , $Options,$defaultchoice)
+
+#Check if the #-users and #-Licenses match
+#IE E3, then Check the QTY of licenses
+if($needLicenses -eq 1)
+{
+    $planName="MCOEV" #This is the name of the Phone System License we need to add to the users
+    $licenses = New-Object -TypeName Microsoft.Open.AzureAD.Model.AssignedLicense
+    $licenses = Get-AzureADSubscribedSku | Where-Object -Property SkuPartNumber -Value $planName -EQ | Select -Property Sku*,ConsumedUnits -ExpandProperty PrepaidUnits
+    $License = New-Object -TypeName Microsoft.Open.AzureAD.Model.AssignedLicense
+    $License.SkuId = $licenses.SkuId
+    $LicensesToAssign = New-Object -TypeName Microsoft.Open.AzureAD.Model.AssignedLicenses
+    $LicensesToAssign.AddLicenses = $License
+
+    $remainingLicenses = $licenses.enabled - $licenses.ConsumedUnits
+    $remainingLicensesAfterAllocation = $remainingLicenses
+
+    if($remainingLicenses -lt $numUsers)
+    {
+        Write-Host "CAUTION: There may not be enough licenses to cover all the users in imported CSV, We'll try anyway" -ForegroundColor Black -BackgroundColor DarkYellow
+    }
+
+    #Setup a few variables
+    [int]$alreadyAssigned = 0
+    [int]$newlyAssigned = 0
+
+    foreach($csvUser in $global:inputdata)
+    {
+        Write-Host "Setting up user: "$csvUser.UserPrincipalName -ForegroundColor Black -BackgroundColor Gray     
+
+        #Check user is a Skype for Business ONLINE user and not On-Prem
+        Try {$checkRP = Get-CsOnlineUser -Identity $csvUser.UserPrincipalName -ErrorAction Stop}
+        Catch {Write-Host "Something is wrong with this user. Please check the UPN is correct. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; $checkRP.RegistrarPool = "NOTHING"; Pause}
+        Write-Debug "`$checkRP.RegistrarPool is"
+        Write-Debug $checkRP.RegistrarPool
+        if($checkRP.RegistrarPool.Contains("infra.lync.com"))
+        {
+           
+            Try {$userAzure = Get-AzureADUser -ObjectID $csvUser.UserPrincipalName -ErrorAction Stop}
+            Catch {Write-Host "We're unable to get the users details. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; Pause}
+           
+            #Check user's usage location is set to Australia
+            if($userAzure.UsageLocation -ne "AU")
+            {
+                Try {Set-AzureADUser -ObjectID $csvUser.UserPrincipalName -UsageLocation "AU" -ErrorAction Stop}
+                Catch {Write-Host "We're unable to set the users usage Location to Australia. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; Pause}
+                
+            }
+            Write-Host "Location: "(Get-AzureADUser -ObjectID $csvUser.UserPrincipalName).UsageLocation
+            
+
+            #Check if user has a Phone System license
+            if($hasLicense = Get-AzureADUserLicenseDetail -objectid $csvUser.UserPrincipalName | where SkuId -eq $License.SkuId)
+            {
+                $alreadyAssigned++
+            } else {
+                $newlyAssigned++
+                $remainingLicensesAfterAllocation = $remainingLicenses - $newlyAssigned;
+                Try {Set-AzureADUserLicense -objectid $csvUser.UserPrincipalName -AssignedLicenses $LicensesToAssign -ErrorAction Stop}
+                Catch {$remainingLicensesAfterAllocation--; $newlyAssigned--; Write-Host "Unable to Assign a license to user. Estimated licenses remaining are $remainingLicensesAfterAllocation. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; Pause}
+            }
+
+        } else {
+            if($checkRP.RegistrarPool -ne "NOTHING") {
+                Write-Host "User "$csvUser.UserPrincipalName" isn't correctly setup and isn't homed in Office 365. Maybe it's an On-Prem user?" -ForegroundColor Yellow -BackgroundColor Red
+            }
+        }
+    }
+
+    Write-Host "OK, Everything is looking good, however we need to wait a few mins to allow the licenses to apply before we can continue" -ForegroundColor Black -BackgroundColor Cyan
+    Write-Host "Waiting 5 minutes..."
+    
+    Start-Sleep -Seconds 60
+    Write-Host "Waiting 4 more minutes..."
+    Start-Sleep -Seconds 60
+    Write-Host "Waiting 3 more minutes..."
+    Start-Sleep -Seconds 60
+    Write-Host "Waiting 2 more minutes..."
+    Start-Sleep -Seconds 60
+    Write-Host "Waiting 1 more minutes..."
+    Start-Sleep -Seconds 60
+    
+        
+
+    foreach($csvUser in $global:inputdata)
+    {
+        #Provision the user for PSTN Calling
+        Write-Host "Continuing for user: "$csvUser.UserPrincipalName -ForegroundColor Black -BackgroundColor Gray 
+        $pstnNumber = "tel:+"+$csvUser.DID
+        Write-Host "Setting PSTN Number "$csvUser.DID
+        #Enable Enterprise Voice, Enable Hosted Voicemail or Add the users PSTN Number
+        Try {Set-CsUser -Identity $csvUser.UserPrincipalName -EnterpriseVoiceEnabled $true -HostedVoiceMail $true -OnPremLineURI $pstnNumber -ErrorAction Stop}
+        Catch {Write-Host "Unable to either Enable Enterprise Voice, Enable Hosted Voicemail or Add the users PSTN Number. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; Pause}
+        # Set the calling policy to Australia - Script is currently only setup for Australian users
+        Try {Grant-CsOnlineVoiceRoutingPolicy -Identity $csvUser.UserPrincipalName -PolicyName Australia -ErrorAction Stop}
+        Catch {Write-Host "Unable Set the users Voice Calling policy to Australia. $ErrorMsg" -ForegroundColor Yellow -BackgroundColor Red; Pause}
+    }
+}
+
+Write-Host "                   " -ForegroundColor Black -BackgroundColor Green
+Write-Host "                   " -ForegroundColor Black -BackgroundColor Green
+Write-Host "                   " -ForegroundColor Black -BackgroundColor Green
+Write-Host "Licenses that were already assigned: "$alreadyAssigned -ForegroundColor White -BackgroundColor Magenta
+Write-Host "Licenses that were newly assigned: "$newlyAssigned -ForegroundColor White -BackgroundColor Magenta
+Write-Host "Estimated licenses remaining in the 365 tenant are: $remainingLicensesAfterAllocation" -ForegroundColor White -BackgroundColor Magenta
+Write-Host "                   " -ForegroundColor Black -BackgroundColor Green
+Write-Host "OK, We're all done!" -ForegroundColor Black -BackgroundColor Green
+Write-Host "                   " -ForegroundColor Black -BackgroundColor Green
+Pause
